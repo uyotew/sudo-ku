@@ -1,0 +1,365 @@
+const std = @import("std");
+const playSudoku = @import("sudoku.zig").playSudoku;
+const eql = std.mem.eql;
+const crypt = @cImport(@cInclude("crypt.h")).crypt;
+
+pub fn main() !void {
+    const pal = std.heap.page_allocator;
+    const args = switch (try ArgsRes.parse(pal)) {
+        .a => |a| a,
+        .parse_err => |err_msg| return usage(err_msg),
+        .help => return usage(null),
+        .check_conf => |path| {
+            // set the effective id to the user id, so
+            // the check flag cannot be used too snoop on unowned filed
+            try std.os.seteuid(std.os.linux.getuid());
+            _ = try parseConfig(path, pal);
+            return;
+        },
+    };
+    const rules = try parseConfig("/etc/sudokuers", pal) orelse return;
+    const rule = try matchRule(rules, args) orelse return error.Denied;
+    if (rule.opr == .Deny) return error.Denied;
+    if (rule.opts.sudoku) |cells| if (!try playSudoku(cells)) return error.Denied;
+    if (!rule.opts.nopass) if (!try checkPassword(pal)) return error.Denied;
+
+    const as_user_id = (try std.process.posixGetUserInfo(args.user)).uid;
+    try std.os.setuid(as_user_id);
+
+    var argv = std.ArrayList([]const u8).init(pal);
+    try argv.append(args.command);
+    try argv.appendSlice(args.cmd_args);
+
+    return std.process.execv(pal, argv.items);
+}
+
+fn checkPassword(pal: std.mem.Allocator) !bool {
+    const pwd = blk: {
+        var buf: [512]u8 = undefined;
+        break :blk try getPasswordFromUser(&buf);
+    };
+    const user = try getUsernameFromId(pal, std.os.linux.getuid());
+    const entry = try getShadowEntry(pal, user);
+    const pwd_hash = crypt(try pal.dupeZ(u8, pwd), try pal.dupeZ(u8, entry));
+    if (eql(u8, std.mem.span(pwd_hash), entry)) return true;
+    return false;
+}
+fn getPasswordFromUser(buf: []u8) ![]const u8 {
+    const w = std.io.getStdOut().writer();
+    const r = std.io.getStdIn().reader();
+    try w.writeAll("[sudo-ku] password: ");
+    const original_termios = try std.os.tcgetattr(0);
+    try std.os.tcsetattr(0, .FLUSH, blk: {
+        var termios = original_termios;
+        termios.lflag &= ~std.os.linux.ECHO;
+        break :blk termios;
+    });
+    const len = try r.read(buf);
+    try w.writeAll("\n");
+    try std.os.tcsetattr(0, .FLUSH, original_termios);
+    return buf[0 .. len - 1];
+}
+
+pub fn getUsernameFromId(pal: std.mem.Allocator, id: std.os.uid_t) ![]const u8 {
+    var f = try std.fs.openFileAbsolute("/etc/passwd", .{});
+    defer f.close();
+    const buf = try f.readToEndAlloc(pal, 1 << 16);
+    var line_it = std.mem.splitScalar(u8, buf, '\n');
+    const err = error.CorruptedPasswdFile;
+    while (line_it.next()) |line| {
+        var it = std.mem.splitScalar(u8, line, ':');
+        const user = it.next() orelse return err;
+        _ = it.next() orelse return err;
+        const id_str = it.next() orelse return err;
+        if (try std.fmt.parseUnsigned(std.os.uid_t, id_str, 10) == id) {
+            return user;
+        } else continue;
+    }
+    return error.UserNotFound;
+}
+
+fn getShadowEntry(pal: std.mem.Allocator, name: []const u8) ![]const u8 {
+    var f = try std.fs.openFileAbsolute("/etc/shadow", .{});
+    defer f.close();
+    const buf = try f.readToEndAlloc(pal, 1 << 16);
+    var line_it = std.mem.splitScalar(u8, buf, '\n');
+    const err = error.CorruptedShadowFile;
+    while (line_it.next()) |line| {
+        var it = std.mem.splitScalar(u8, line, ':');
+        const user = it.next() orelse return err;
+        if (!eql(u8, user, name)) continue;
+        const pwd = it.next() orelse return err;
+        if (pwd[0] == '!' or pwd[0] == '*') return error.UserHasNoPassword;
+        return pwd;
+    }
+    return error.UserNotFound;
+}
+
+fn getGroupId(name: []const u8) !std.os.gid_t {
+    var f = try std.fs.openFileAbsolute("/etc/group", .{});
+    defer f.close();
+    var buf: [std.mem.page_size]u8 = undefined;
+    var name_i: usize = 0;
+    var colon_n: usize = 0;
+    var cnt = false;
+    var id: std.os.gid_t = 0;
+    outer: while (true) {
+        const len = try f.read(&buf);
+        if (len == 0) break;
+        for (buf[0..len]) |b| {
+            if (cnt) {
+                if (b == '\n') cnt = false;
+                continue;
+            }
+            if (colon_n == 2) {
+                if (b == ':') break :outer;
+                id *= 10;
+                id += b - '0';
+                continue;
+            }
+            if (b == ':' and name_i == name.len) {
+                colon_n += 1;
+                continue;
+            }
+            if (colon_n == 1) continue;
+            if (name_i < name.len and b == name[name_i]) {
+                name_i += 1;
+                continue;
+            }
+            name_i = 0;
+            cnt = true;
+        }
+    }
+    return id;
+}
+
+fn matchRule(rules: []const Rule, args: ArgsRes.Args) !?Rule {
+    const user = std.os.linux.getuid();
+    var groups: [256]std.os.gid_t = undefined;
+    const g_len = std.os.linux.getgroups(256, @ptrCast(&groups));
+    if (g_len < 0) return error.ErrorGettingGroups;
+
+    return top: for (rules) |r| {
+        if (switch (r.idt) {
+            .user => |u| (try std.process.posixGetUserInfo(u)).uid != user,
+            .group => |g_name| blk: {
+                const g_id = try getGroupId(g_name);
+                for (0..g_len) |i| {
+                    if (groups[i] == g_id) break :blk false;
+                } else break :blk true;
+            },
+        }) continue;
+        if (r.as_user) |u| if (!eql(u8, args.user, u)) continue;
+        if (r.cmd) |c| {
+            if (!eql(u8, c, args.command)) continue;
+            if (r.args) |a| {
+                if (a.len != args.cmd_args.len) continue;
+                for (a, args.cmd_args) |ra, ca| if (!eql(u8, ra, ca)) continue :top;
+            }
+        }
+        break r;
+    } else null;
+}
+
+fn parseConfig(path: []const u8, pal: std.mem.Allocator) !?[]const Rule {
+    const buf = blk: {
+        const f = try std.fs.cwd().openFile(path, .{});
+        defer f.close();
+        break :blk try f.readToEndAlloc(pal, 1 << 16);
+    };
+    var list = std.ArrayList(Rule).init(pal);
+    var it = std.mem.splitScalar(u8, buf, '\n');
+    var line_n: usize = 1;
+    while (it.next()) |line| : (line_n += 1) {
+        const l = std.mem.trim(u8, line, "\t ");
+        if (l.len == 0) continue;
+        if (l[0] == '#') continue;
+        switch (try Rule.parse(line, pal)) {
+            .rule => |r| try list.append(r),
+            .err => |e| {
+                var p = try pal.alloc(u8, if (e.c > 0) e.c else 1);
+                @memset(p, ' ');
+                p[p.len - 1] = '^';
+                std.log.err("{s} in file: {s}:{}:{}\n{s}\n{s}", .{ @errorName(e.err), path, line_n, e.c, line, p });
+                return null;
+            },
+        }
+    }
+    return list.items;
+}
+
+const Rule = struct {
+    const Opr = enum { Permit, Deny };
+    const Options = struct {
+        nopass: bool = false,
+        sudoku: ?u8 = null,
+        nolog: bool = false,
+        persist: ?u32 = null,
+    };
+    const Identity = union(enum) {
+        user: []const u8,
+        group: []const u8,
+    };
+    opr: Opr,
+    opts: Options = .{},
+    idt: Identity,
+    as_user: ?[]const u8 = null,
+    cmd: ?[]const u8 = null,
+    args: ?[]const []const u8 = null,
+
+    pub const ParseRet = union(enum) {
+        rule: Rule,
+        err: struct { err: anyerror, c: usize },
+
+        fn e(i: usize, err: anyerror) ParseRet {
+            return .{ .err = .{ .err = err, .c = i + 1 } };
+        }
+    };
+
+    pub fn parse(line: []const u8, pal: std.mem.Allocator) !ParseRet {
+        var it = std.mem.tokenizeAny(u8, line, "\t ");
+        const e = ParseRet.e;
+
+        const opr: Opr = blk: {
+            const err = error.ExpectedPermitOrDeny;
+            const b = it.next() orelse return e(0, err);
+            if (eql(u8, b, "permit")) break :blk .Permit;
+            if (eql(u8, b, "deny")) break :blk .Deny;
+            return e(it.index - b.len, err);
+        };
+        const opts = blk: {
+            var o: Rule.Options = .{};
+            while (it.next()) |b| {
+                if (eql(u8, b, "for")) {
+                    break;
+                } else if (eql(u8, b, "nopass")) {
+                    o.nopass = true;
+                } else if (eql(u8, b, "nolog")) {
+                    o.nolog = true;
+                } else if (std.mem.startsWith(u8, b, "persist")) {
+                    if (b.len == 7) o.persist = 15 else if (b[7] == '=') {
+                        const n = std.fmt.parseUnsigned(u32, b[8..], 10);
+                        o.persist = n catch |err| return e(it.index - b.len + 8, err);
+                    } else return e(it.index - b.len + 7, error.ExpectedEquals);
+                } else if (std.mem.startsWith(u8, b, "sudoku")) {
+                    if (b.len == 6) o.sudoku = 40 else if (b[6] == '=') {
+                        const n = std.fmt.parseUnsigned(u8, b[7..], 10);
+                        o.sudoku = n catch return e(it.index - b.len + 7, error.InvalidNumber);
+                    } else return e(it.index - b.len + 6, error.ExpectedEqulas);
+                    if (o.sudoku.? > 80 or o.sudoku.? < 20) {
+                        return e(it.index - b.len + 7, error.InvalidNumberOfSudokuCells);
+                    }
+                } else return e(it.index - b.len, error.InvalidOption);
+            } else return e(it.index + 1, error.ExpectedFor);
+            break :blk o;
+        };
+        const idt: Identity = blk: {
+            const b = it.next() orelse return e(it.index + 1, error.ExpectedIdentity);
+            if (std.mem.startsWith(u8, b, ":")) break :blk .{ .group = b[1..] };
+            break :blk .{ .user = b };
+        };
+        const as_user = blk: {
+            if (eql(u8, it.peek() orelse "", "as")) {
+                _ = it.next();
+                break :blk it.next() orelse return e(it.index + 1, error.ExpectedTarget);
+            } else break :blk null;
+        };
+        const cmd = blk: {
+            if (eql(u8, it.peek() orelse "", "cmd")) {
+                _ = it.next();
+                break :blk it.next() orelse return e(it.index + 1, error.ExpectedCommand);
+            } else break :blk null;
+        };
+        const args = blk: {
+            if (cmd != null and eql(u8, it.peek() orelse "", "args")) {
+                _ = it.next();
+                var list = std.ArrayList([]const u8).init(pal);
+                while (it.next()) |a| try list.append(a);
+                break :blk list.items;
+            } else break :blk null;
+        };
+        if (it.peek() != null) return e(it.index, error.ExpectedEndOfLine);
+        return .{ .rule = Rule{
+            .opr = opr,
+            .opts = opts,
+            .idt = idt,
+            .as_user = as_user,
+            .cmd = cmd,
+            .args = args,
+        } };
+    }
+};
+
+const ArgsRes = union(enum) {
+    const Args = struct {
+        command: []const u8 = undefined,
+        cmd_args: []const []const u8 = &[0][]u8{},
+        user: []const u8 = "root",
+    };
+    a: Args,
+    parse_err: []const u8,
+    help,
+    check_conf: []const u8,
+
+    pub fn parse(pal: std.mem.Allocator) !ArgsRes {
+        var arg_buf = try std.process.argsAlloc(pal);
+        if (arg_buf.len < 2) return .{ .parse_err = "No command specified" };
+        var args = ArgsRes.Args{};
+
+        var i: usize = 1;
+        while (i < arg_buf.len) : (i += 1) {
+            const a = arg_buf[i];
+            if (!std.mem.startsWith(u8, a, "-")) {
+                args.command = a;
+                if (arg_buf.len > i + 1) {
+                    args.cmd_args = arg_buf[i + 1 ..];
+                }
+                break;
+            }
+            if (eql(u8, a, "--")) {
+                if (arg_buf.len > i + 1) {
+                    args.command = arg_buf[i + 1];
+                    if (arg_buf.len > i + 2) {
+                        args.cmd_args = arg_buf[i + 2 ..];
+                    }
+                    break;
+                } else return .{ .parse_err = "No command specified" };
+            }
+            for (1..a.len) |j| {
+                switch (a[j]) {
+                    'h' => return .{ .help = {} },
+                    'u' => if (arg_buf.len > i + 1) {
+                        i += 1;
+                        args.user = arg_buf[i];
+                    } else return .{ .parse_err = "No user specified" },
+                    'c' => if (arg_buf.len > i + 1) {
+                        i += 1;
+                        return .{ .check_conf = arg_buf[i] };
+                    } else return .{ .parse_err = "No file specified" },
+                    else => return .{
+                        .parse_err = try std.fmt.allocPrint(pal, "{c} is not an option", .{a[j]}),
+                    },
+                }
+            }
+        }
+        return .{ .a = args };
+    }
+};
+
+fn usage(err: ?[]const u8) void {
+    const name = blk: {
+        var it = std.process.args();
+        break :blk it.next();
+    };
+
+    if (err) |e| std.log.err("{s}\n", .{e});
+    std.log.info(
+        \\Usage: {?s} [Options] [--] command
+        \\Options:
+        \\ -h                  help
+        \\ -u user             run command as user (default root)
+        \\ -c sudokuers-file   check/verify syntax of sudokuers-file
+        \\ --                  stop parsing of options
+        \\
+    , .{name});
+}

@@ -33,7 +33,7 @@ pub fn main() !void {
             defer std.os.closeSocket(fd);
 
             var cwd_buf: [std.os.PATH_MAX]u8 = undefined;
-            const message = try std.fmt.allocPrint(pal, "{s} PWD={s} USER={s} COMMAND={s}", .{
+            const message = try std.fmt.allocPrint(pal, "<5>{s} PWD={s} USER={s} COMMAND={s}", .{
                 try getUsernameFromId(pal, std.os.linux.getuid()),
                 try std.os.getcwd(&cwd_buf),
                 args.user,

@@ -344,12 +344,12 @@ const Rule = struct {
                     if (b.len == 7) o.persist = 15 else if (b[7] == '=') {
                         const n = std.fmt.parseUnsigned(u32, b[8..], 10);
                         o.persist = n catch |err| return e(it.index - b.len + 8, err);
-                    } else return e(it.index - b.len + 7, error.ExpectedEquals);
+                    } else return e(it.index - b.len, error.InvalidOption);
                 } else if (std.mem.startsWith(u8, b, "sudoku")) {
                     if (b.len == 6) o.sudoku = 40 else if (b[6] == '=') {
                         const n = std.fmt.parseUnsigned(u8, b[7..], 10);
                         o.sudoku = n catch return e(it.index - b.len + 7, error.InvalidNumber);
-                    } else return e(it.index - b.len + 6, error.ExpectedEqulas);
+                    } else return e(it.index - b.len, error.InvalidOption);
                     if (o.sudoku.? > 80 or o.sudoku.? < 20) {
                         return e(it.index - b.len + 7, error.InvalidNumberOfSudokuCells);
                     }

@@ -1,8 +1,8 @@
 persistence
   sudo owned tmp files with timestamps?
-logging to systemd-journald
 password:
   maybe a timeout?
+  use pam?
   an error saying. password wrong..
   maybe look at the implementation of crypt in glibc...
   is it recreatable in zig?

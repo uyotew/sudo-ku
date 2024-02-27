@@ -15,7 +15,7 @@ permit|deny [options] for identity [as target] [cmd command [args ...]]
 options:
   nopass      does not require password
   sudoku[=n]    require solving sudoku with n given cells (default 40) (20 <= n <= 80)
-  nolog       disables logging
+  nolog       disables syslog logging
   persist[=n]   does not require auth until n minutes has passed (default 15)
 
 identity:    

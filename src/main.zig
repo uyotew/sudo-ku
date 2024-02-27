@@ -13,24 +13,38 @@ pub fn main() !void {
             // set the effective id to the user id, so
             // the check flag cannot be used too snoop on unowned filed
             try std.os.seteuid(std.os.linux.getuid());
-            _ = try parseConfig(path, pal);
+            _ = try parseConfig(pal, path);
             return;
         },
     };
-    const rules = try parseConfig("/etc/sudokuers", pal) orelse return;
+    const rules = try parseConfig(pal, "/etc/sudokuers") orelse return;
     const rule = try matchRule(rules, args) orelse return error.Denied;
     if (rule.opr == .Deny) return error.Denied;
     if (rule.opts.sudoku) |cells| if (!try playSudoku(cells)) return error.Denied;
     if (!rule.opts.nopass) if (!try checkPassword(pal)) return error.Denied;
 
-    const as_user_id = (try std.process.posixGetUserInfo(args.user)).uid;
-    try std.os.setuid(as_user_id);
-
     var argv = std.ArrayList([]const u8).init(pal);
     try argv.append(args.command);
     try argv.appendSlice(args.cmd_args);
+    if (try std.os.fork() == 0) {
+        if (!rule.opts.nolog) {
+            const log_addr = try std.net.Address.initUnix("/dev/log");
+            const fd = try std.os.socket(std.os.AF.UNIX, std.os.SOCK.DGRAM, 0);
+            defer std.os.closeSocket(fd);
 
-    return std.process.execv(pal, argv.items);
+            var cwd_buf: [std.os.PATH_MAX]u8 = undefined;
+            const message = try std.fmt.allocPrint(pal, "{s} PWD={s} USER={s} COMMAND={s}", .{
+                try getUsernameFromId(pal, std.os.linux.getuid()),
+                try std.os.getcwd(&cwd_buf),
+                args.user,
+                try std.mem.join(pal, " ", argv.items),
+            });
+            _ = try std.os.sendto(fd, message, 0, &log_addr.any, log_addr.getOsSockLen());
+        }
+        const as_user_id = (try std.process.posixGetUserInfo(args.user)).uid;
+        try std.os.setuid(as_user_id);
+        return std.process.execv(pal, argv.items);
+    } else return;
 }
 
 fn checkPassword(pal: std.mem.Allocator) !bool {
@@ -161,7 +175,7 @@ fn matchRule(rules: []const Rule, args: ArgsRes.Args) !?Rule {
     } else null;
 }
 
-fn parseConfig(path: []const u8, pal: std.mem.Allocator) !?[]const Rule {
+fn parseConfig(pal: std.mem.Allocator, path: []const u8) !?[]const Rule {
     const buf = blk: {
         const f = try std.fs.cwd().openFile(path, .{});
         defer f.close();

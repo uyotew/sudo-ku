@@ -18,43 +18,98 @@ pub fn main() !void {
         },
     };
     const rules = try parseConfig(pal, "/etc/sudokuers") orelse return;
+    defer pal.free(rules);
     const rule = try matchRule(rules, args) orelse return error.Denied;
     if (rule.opr == .Deny) return error.Denied;
-    if (rule.opts.sudoku) |cells| if (!try playSudoku(cells)) return error.Denied;
-    if (!rule.opts.nopass) if (!try checkPassword(pal)) return error.Denied;
+
+    if (rule.opts.persist) |mins| {
+        var file_exists = true;
+        const path = try getRulePersistentFilePath(pal, rule);
+        defer pal.free(path);
+        const fd = std.fs.openFileAbsolute(path, .{ .mode = .write_only }) catch |err| switch (err) {
+            error.FileNotFound => l: {
+                file_exists = false;
+                break :l try std.fs.createFileAbsolute(path, .{});
+            },
+            else => return err,
+        };
+        defer fd.close();
+        const stat = try fd.stat();
+        const mins_in_ns: i128 = @as(i128, @intCast(mins)) * std.time.ns_per_min;
+        if (file_exists and stat.mtime + mins_in_ns > std.time.nanoTimestamp()) {
+            _ = try fd.write("0");
+        } else {
+            if (rule.opts.sudoku) |cells| if (!try playSudoku(cells)) return error.Denied;
+            if (!rule.opts.nopass) if (!try checkPassword(pal)) return error.Denied;
+            _ = try fd.write("0");
+        }
+    } else {
+        if (rule.opts.sudoku) |cells| if (!try playSudoku(cells)) return error.Denied;
+        if (!rule.opts.nopass) if (!try checkPassword(pal)) return error.Denied;
+    }
 
     var argv = std.ArrayList([]const u8).init(pal);
     try argv.append(args.command);
     try argv.appendSlice(args.cmd_args);
-    if (try std.os.fork() == 0) {
-        if (!rule.opts.nolog) {
-            const log_addr = try std.net.Address.initUnix("/dev/log");
-            const fd = try std.os.socket(std.os.AF.UNIX, std.os.SOCK.DGRAM, 0);
-            defer std.os.closeSocket(fd);
+    return switch (std.process.execv(pal, argv.items)) {
+        error.FileNotFound => error.CommandNotFound,
+        else => |e| e,
+    };
+    // if (try std.os.fork() == 0) {
+    //     if (!rule.opts.nolog) {
+    //         const log_addr = try std.net.Address.initUnix("/dev/log");
+    //         const fd = try std.os.socket(std.os.AF.UNIX, std.os.SOCK.DGRAM, 0);
+    //         defer std.os.closeSocket(fd);
 
-            var cwd_buf: [std.os.PATH_MAX]u8 = undefined;
-            const message = try std.fmt.allocPrint(pal, "<5>{s} PWD={s} USER={s} COMMAND={s}", .{
-                try getUsernameFromId(pal, std.os.linux.getuid()),
-                try std.os.getcwd(&cwd_buf),
-                args.user,
-                try std.mem.join(pal, " ", argv.items),
-            });
-            _ = try std.os.sendto(fd, message, 0, &log_addr.any, log_addr.getOsSockLen());
-        }
-        const as_user_id = (try std.process.posixGetUserInfo(args.user)).uid;
-        try std.os.setuid(as_user_id);
-        return std.process.execv(pal, argv.items);
-    } else return;
+    //         var cwd_buf: [std.os.PATH_MAX]u8 = undefined;
+    //         const message = try std.fmt.allocPrint(pal, "<5>{s} PWD={s} USER={s} COMMAND={s}", .{
+    //             try getUsernameFromId(pal, std.os.linux.getuid()),
+    //             try std.os.getcwd(&cwd_buf),
+    //             args.user,
+    //             try std.mem.join(pal, " ", argv.items),
+    //         });
+    //         defer pal.free(message);
+    //         _ = try std.os.sendto(fd, message, 0, &log_addr.any, log_addr.getOsSockLen());
+    //     }
+    //     const as_user_id = (try std.process.posixGetUserInfo(args.user)).uid;
+    //     try std.os.setuid(as_user_id);
+
+    //     //doc-comment on execv says it's illegal to call it from a fork..
+    //     //it seems to work still though
+    //     //just don't free the args... let them leak....
+    //     return switch (std.process.execv(pal, argv.items)) {
+    //         error.FileNotFound => error.CommandNotFound,
+    //         else => |e| e,
+    //     };
+    // } else return;
+}
+
+fn getRulePersistentFilePath(pal: std.mem.Allocator, rule: Rule) ![]const u8 {
+    std.fs.makeDirAbsolute("/tmp/sudo-ku") catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+    const serialized = try rule.serialize(pal);
+    defer pal.free(serialized);
+    const hash_raw = std.hash.Wyhash.hash(342912, serialized);
+    const encoder = std.base64.url_safe.Encoder;
+    var hash_buf: [encoder.calcSize(8)]u8 = undefined;
+    const hash = encoder.encode(&hash_buf, @as(*const [8]u8, @ptrCast(&hash_raw)));
+    return try std.mem.concat(pal, u8, &.{ "/tmp/sudo-ku/", hash });
 }
 
 fn checkPassword(pal: std.mem.Allocator) !bool {
     const pwd = blk: {
-        var buf: [512]u8 = undefined;
+        var buf: [2048]u8 = undefined;
         break :blk try getPasswordFromUser(&buf);
     };
     const user = try getUsernameFromId(pal, std.os.linux.getuid());
     const entry = try getShadowEntry(pal, user);
-    const pwd_hash = crypt(try pal.dupeZ(u8, pwd), try pal.dupeZ(u8, entry));
+    const pwd_c = try pal.dupeZ(u8, pwd);
+    defer pal.free(pwd_c);
+    const entry_c = try pal.dupeZ(u8, entry);
+    defer pal.free(entry_c);
+    const pwd_hash = crypt(pwd_c, entry_c);
     if (eql(u8, std.mem.span(pwd_hash), entry)) return true;
     return false;
 }
@@ -71,6 +126,7 @@ fn getPasswordFromUser(buf: []u8) ![]const u8 {
     const len = try r.read(buf);
     try w.writeAll("\n");
     try std.os.tcsetattr(0, .FLUSH, original_termios);
+    if (len - 1 >= buf.len) return error.PasswordTooLong;
     return buf[0 .. len - 1];
 }
 
@@ -78,6 +134,7 @@ pub fn getUsernameFromId(pal: std.mem.Allocator, id: std.os.uid_t) ![]const u8 {
     var f = try std.fs.openFileAbsolute("/etc/passwd", .{});
     defer f.close();
     const buf = try f.readToEndAlloc(pal, 1 << 16);
+    defer pal.free(buf);
     var line_it = std.mem.splitScalar(u8, buf, '\n');
     const err = error.CorruptedPasswdFile;
     while (line_it.next()) |line| {
@@ -86,7 +143,7 @@ pub fn getUsernameFromId(pal: std.mem.Allocator, id: std.os.uid_t) ![]const u8 {
         _ = it.next() orelse return err;
         const id_str = it.next() orelse return err;
         if (try std.fmt.parseUnsigned(std.os.uid_t, id_str, 10) == id) {
-            return user;
+            return try pal.dupe(u8, user);
         } else continue;
     }
     return error.UserNotFound;
@@ -96,6 +153,7 @@ fn getShadowEntry(pal: std.mem.Allocator, name: []const u8) ![]const u8 {
     var f = try std.fs.openFileAbsolute("/etc/shadow", .{});
     defer f.close();
     const buf = try f.readToEndAlloc(pal, 1 << 16);
+    defer pal.free(buf);
     var line_it = std.mem.splitScalar(u8, buf, '\n');
     const err = error.CorruptedShadowFile;
     while (line_it.next()) |line| {
@@ -104,7 +162,7 @@ fn getShadowEntry(pal: std.mem.Allocator, name: []const u8) ![]const u8 {
         if (!eql(u8, user, name)) continue;
         const pwd = it.next() orelse return err;
         if (pwd[0] == '!' or pwd[0] == '*') return error.UserHasNoPassword;
-        return pwd;
+        return try pal.dupe(u8, pwd);
     }
     return error.UserNotFound;
 }
@@ -181,6 +239,7 @@ fn parseConfig(pal: std.mem.Allocator, path: []const u8) !?[]const Rule {
         defer f.close();
         break :blk try f.readToEndAlloc(pal, 1 << 16);
     };
+    defer pal.free(buf);
     var list = std.ArrayList(Rule).init(pal);
     var it = std.mem.splitScalar(u8, buf, '\n');
     var line_n: usize = 1;
@@ -192,6 +251,7 @@ fn parseConfig(pal: std.mem.Allocator, path: []const u8) !?[]const Rule {
             .rule => |r| try list.append(r),
             .err => |e| {
                 var p = try pal.alloc(u8, if (e.c > 0) e.c else 1);
+                defer pal.free(p);
                 @memset(p, ' ');
                 p[p.len - 1] = '^';
                 std.log.err("{s} in file: {s}:{}:{}\n{s}\n{s}", .{ @errorName(e.err), path, line_n, e.c, line, p });
@@ -199,7 +259,7 @@ fn parseConfig(pal: std.mem.Allocator, path: []const u8) !?[]const Rule {
             },
         }
     }
-    return list.items;
+    return try list.toOwnedSlice();
 }
 
 const Rule = struct {
@@ -229,6 +289,36 @@ const Rule = struct {
             return .{ .err = .{ .err = err, .c = i + 1 } };
         }
     };
+    /// only called before hashing
+    pub fn serialize(rule: Rule, pal: std.mem.Allocator) ![]u8 {
+        var lst = std.ArrayList(u8).init(pal);
+        try lst.append(@intFromEnum(rule.opr));
+        try lst.append(@intFromBool(rule.opts.nopass));
+        try lst.append(@intFromBool(rule.opts.nolog));
+        std.debug.assert(rule.opts.sudoku orelse 1 > 0);
+        try lst.append(rule.opts.sudoku orelse 0);
+        try lst.appendSlice(@as(*const [4]u8, @ptrCast(&rule.opts.persist.?)));
+        switch (rule.idt) {
+            .user => |u| {
+                try lst.append(0);
+                try lst.appendSlice(u);
+            },
+            .group => |g| {
+                try lst.append(1);
+                try lst.appendSlice(g);
+            },
+        }
+        try lst.append(@intFromBool(rule.as_user == null));
+        if (rule.as_user) |u| try lst.appendSlice(u);
+        try lst.append(@intFromBool(rule.cmd == null));
+        if (rule.cmd) |c| try lst.appendSlice(c);
+        try lst.append(@intFromBool(rule.args == null));
+        if (rule.args) |args| for (args) |a| {
+            try lst.appendSlice(a);
+            try lst.append(0);
+        };
+        return try lst.toOwnedSlice();
+    }
 
     pub fn parse(line: []const u8, pal: std.mem.Allocator) !ParseRet {
         var it = std.mem.tokenizeAny(u8, line, "\t ");
@@ -269,27 +359,29 @@ const Rule = struct {
         };
         const idt: Identity = blk: {
             const b = it.next() orelse return e(it.index + 1, error.ExpectedIdentity);
-            if (std.mem.startsWith(u8, b, ":")) break :blk .{ .group = b[1..] };
-            break :blk .{ .user = b };
+            if (std.mem.startsWith(u8, b, ":")) break :blk .{ .group = try pal.dupe(u8, b[1..]) };
+            break :blk .{ .user = try pal.dupe(u8, b) };
         };
         const as_user = blk: {
             if (eql(u8, it.peek() orelse "", "as")) {
                 _ = it.next();
-                break :blk it.next() orelse return e(it.index + 1, error.ExpectedTarget);
+                const u = it.next() orelse return e(it.index + 1, error.ExpectedTarget);
+                break :blk try pal.dupe(u8, u);
             } else break :blk null;
         };
         const cmd = blk: {
             if (eql(u8, it.peek() orelse "", "cmd")) {
                 _ = it.next();
-                break :blk it.next() orelse return e(it.index + 1, error.ExpectedCommand);
+                const c = it.next() orelse return e(it.index + 1, error.ExpectedCommand);
+                break :blk try pal.dupe(u8, c);
             } else break :blk null;
         };
         const args = blk: {
             if (cmd != null and eql(u8, it.peek() orelse "", "args")) {
                 _ = it.next();
                 var list = std.ArrayList([]const u8).init(pal);
-                while (it.next()) |a| try list.append(a);
-                break :blk list.items;
+                while (it.next()) |a| try list.append(try pal.dupe(u8, a));
+                break :blk try list.toOwnedSlice();
             } else break :blk null;
         };
         if (it.peek() != null) return e(it.index, error.ExpectedEndOfLine);

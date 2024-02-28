@@ -67,8 +67,9 @@ pub fn main() !void {
         _ = try std.os.sendto(fd, message, 0, &log_addr.any, log_addr.getOsSockLen());
     }
 
-    const as_user_id = (try std.process.posixGetUserInfo(args.user)).uid;
-    try std.os.setuid(as_user_id);
+    const user_info = try std.process.posixGetUserInfo(args.user);
+    try std.os.setuid(user_info.uid);
+    try std.os.setgid(user_info.gid);
 
     return switch (std.process.execv(pal, argv.items)) {
         error.FileNotFound => error.CommandNotFound,

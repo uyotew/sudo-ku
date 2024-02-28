@@ -87,7 +87,7 @@ fn getRulePersistentFilePath(pal: std.mem.Allocator, rule: Rule) ![]const u8 {
     const hash_raw = std.hash.Wyhash.hash(342912, serialized);
     const encoder = std.base64.url_safe.Encoder;
     var hash_buf: [encoder.calcSize(8)]u8 = undefined;
-    const hash = encoder.encode(&hash_buf, @as(*const [8]u8, @ptrCast(&hash_raw)));
+    const hash = encoder.encode(&hash_buf, &@as([8]u8, @bitCast(hash_raw)));
     return try std.mem.concat(pal, u8, &.{ "/tmp/sudo-ku/", hash });
 }
 
@@ -283,6 +283,7 @@ const Rule = struct {
         }
     };
     /// only called before hashing
+    /// asserts that rule.opts.persist is not null
     pub fn serialize(rule: Rule, pal: std.mem.Allocator) ![]u8 {
         var lst = std.ArrayList(u8).init(pal);
         try lst.append(@intFromEnum(rule.opr));
@@ -290,7 +291,7 @@ const Rule = struct {
         try lst.append(@intFromBool(rule.opts.nolog));
         std.debug.assert(rule.opts.sudoku orelse 1 > 0);
         try lst.append(rule.opts.sudoku orelse 0);
-        try lst.appendSlice(@as(*const [4]u8, @ptrCast(&rule.opts.persist.?)));
+        try lst.appendSlice(&@as([4]u8, @bitCast(rule.opts.persist.?)));
         switch (rule.idt) {
             .user => |u| {
                 try lst.append(0);

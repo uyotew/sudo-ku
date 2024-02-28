@@ -19,7 +19,7 @@ options:
   persist[=n]   does not require auth until n minutes has passed (default 15)
 
 identity:    
-  the username or userid or (if prefixed with ':') the group the rule applies to
+  the username or (if prefixed with ':') the group the rule applies to
 
 target:
   the user that this rule allows running as

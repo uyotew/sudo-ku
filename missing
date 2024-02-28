@@ -9,4 +9,15 @@ password:
 functionality related to environment variables
 restrictions and stuff.
 
+
+
+fork then execve leads to issues..
+running ls with varying options leads to weird results
+ls will not print the prompt after exiting if -l is included in the options
   
+and running sh/bash, it prints:
+sh: initialize_job_control: no job control in background: Bad file descriptor
+and then exits..
+
+changed to not use fork, but only execve again.
+this means also commands that don't exist will be logged..

@@ -51,37 +51,29 @@ pub fn main() !void {
     var argv = std.ArrayList([]const u8).init(pal);
     try argv.append(args.command);
     try argv.appendSlice(args.cmd_args);
+    if (!rule.opts.nolog) {
+        const log_addr = try std.net.Address.initUnix("/dev/log");
+        const fd = try std.os.socket(std.os.AF.UNIX, std.os.SOCK.DGRAM, 0);
+        defer std.os.closeSocket(fd);
+
+        var cwd_buf: [std.os.PATH_MAX]u8 = undefined;
+        const message = try std.fmt.allocPrint(pal, "<5>{s} PWD={s} USER={s} COMMAND={s}", .{
+            try getUsernameFromId(pal, std.os.linux.getuid()),
+            try std.os.getcwd(&cwd_buf),
+            args.user,
+            try std.mem.join(pal, " ", argv.items),
+        });
+        defer pal.free(message);
+        _ = try std.os.sendto(fd, message, 0, &log_addr.any, log_addr.getOsSockLen());
+    }
+
+    const as_user_id = (try std.process.posixGetUserInfo(args.user)).uid;
+    try std.os.setuid(as_user_id);
+
     return switch (std.process.execv(pal, argv.items)) {
         error.FileNotFound => error.CommandNotFound,
         else => |e| e,
     };
-    // if (try std.os.fork() == 0) {
-    //     if (!rule.opts.nolog) {
-    //         const log_addr = try std.net.Address.initUnix("/dev/log");
-    //         const fd = try std.os.socket(std.os.AF.UNIX, std.os.SOCK.DGRAM, 0);
-    //         defer std.os.closeSocket(fd);
-
-    //         var cwd_buf: [std.os.PATH_MAX]u8 = undefined;
-    //         const message = try std.fmt.allocPrint(pal, "<5>{s} PWD={s} USER={s} COMMAND={s}", .{
-    //             try getUsernameFromId(pal, std.os.linux.getuid()),
-    //             try std.os.getcwd(&cwd_buf),
-    //             args.user,
-    //             try std.mem.join(pal, " ", argv.items),
-    //         });
-    //         defer pal.free(message);
-    //         _ = try std.os.sendto(fd, message, 0, &log_addr.any, log_addr.getOsSockLen());
-    //     }
-    //     const as_user_id = (try std.process.posixGetUserInfo(args.user)).uid;
-    //     try std.os.setuid(as_user_id);
-
-    //     //doc-comment on execv says it's illegal to call it from a fork..
-    //     //it seems to work still though
-    //     //just don't free the args... let them leak....
-    //     return switch (std.process.execv(pal, argv.items)) {
-    //         error.FileNotFound => error.CommandNotFound,
-    //         else => |e| e,
-    //     };
-    // } else return;
 }
 
 fn getRulePersistentFilePath(pal: std.mem.Allocator, rule: Rule) ![]const u8 {

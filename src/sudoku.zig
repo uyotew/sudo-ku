@@ -231,7 +231,7 @@ const Sudoku = struct {
         var temp = self;
         const first_sol = temp.solve(&unused, rng, 0);
         const begin_idx: u8 = for (0..81) |d| {
-            const i: u8 = @truncate(80 - d);
+            const i: u8 = @intCast(80 - d);
             if (temp.grid[i / 9][i % 9]) |c| if (!c.given) break i;
         } else unreachable;
         const second_sol = temp.solve(&unused, rng, begin_idx);

@@ -92,21 +92,19 @@ fn getRulePersistentFilePath(pal: std.mem.Allocator, rule: Rule) ![]const u8 {
 }
 
 fn checkPassword(pal: std.mem.Allocator) !bool {
-    const pwd = blk: {
+    const pwd_c = blk: {
         var buf: [2048]u8 = undefined;
         break :blk try getPasswordFromUser(&buf);
     };
     const user = try getUsernameFromId(pal, std.os.linux.getuid());
-    const entry = try getShadowEntry(pal, user);
-    const pwd_c = try pal.dupeZ(u8, pwd);
-    defer pal.free(pwd_c);
-    const entry_c = try pal.dupeZ(u8, entry);
+    defer pal.free(user);
+    const entry_c = try getShadowEntry(pal, user);
     defer pal.free(entry_c);
     const pwd_hash = crypt(pwd_c, entry_c);
-    if (eql(u8, std.mem.span(pwd_hash), entry)) return true;
+    if (eql(u8, std.mem.span(pwd_hash), entry_c)) return true;
     return false;
 }
-fn getPasswordFromUser(buf: []u8) ![]const u8 {
+fn getPasswordFromUser(buf: []u8) ![:0]const u8 {
     const w = std.io.getStdOut().writer();
     const r = std.io.getStdIn().reader();
     try w.writeAll("[sudo-ku] password: ");
@@ -117,10 +115,14 @@ fn getPasswordFromUser(buf: []u8) ![]const u8 {
         break :blk termios;
     });
     const len = try r.read(buf);
-    try w.writeAll("\n");
     try std.os.tcsetattr(0, .FLUSH, original_termios);
-    if (len - 1 >= buf.len) return error.PasswordTooLong;
-    return buf[0 .. len - 1];
+    try w.writeAll("\n");
+
+    if (len == buf.len) return error.PasswordTooLong;
+    // replace the newline from the input with a 0
+    std.debug.assert(len > 0);
+    buf[len - 1] = 0;
+    return buf[0 .. len - 1 :0];
 }
 
 pub fn getUsernameFromId(pal: std.mem.Allocator, id: std.os.uid_t) ![]const u8 {
@@ -142,7 +144,7 @@ pub fn getUsernameFromId(pal: std.mem.Allocator, id: std.os.uid_t) ![]const u8 {
     return error.UserNotFound;
 }
 
-fn getShadowEntry(pal: std.mem.Allocator, name: []const u8) ![]const u8 {
+fn getShadowEntry(pal: std.mem.Allocator, name: []const u8) ![:0]const u8 {
     var f = try std.fs.openFileAbsolute("/etc/shadow", .{});
     defer f.close();
     const buf = try f.readToEndAlloc(pal, 1 << 16);
@@ -155,7 +157,7 @@ fn getShadowEntry(pal: std.mem.Allocator, name: []const u8) ![]const u8 {
         if (!eql(u8, user, name)) continue;
         const pwd = it.next() orelse return err;
         if (pwd[0] == '!' or pwd[0] == '*') return error.UserHasNoPassword;
-        return try pal.dupe(u8, pwd);
+        return try pal.dupeZ(u8, pwd);
     }
     return error.UserNotFound;
 }

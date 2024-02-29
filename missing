@@ -1,7 +1,7 @@
 password:
   maybe a timeout?
-  use pam?
-  pam_unix...
+  more advanced pam?
+  timeout, retries?
   an error saying. password wrong..
   maybe look at the implementation of crypt in glibc...
   is it recreatable in zig?

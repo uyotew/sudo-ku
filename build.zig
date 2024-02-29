@@ -5,14 +5,24 @@ pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const pam = b.option(bool, "pam", "Compile with pam authentication") orelse false;
+
     const exe = b.addExecutable(.{
         .name = "sudo-ku",
         .root_source_file = .{ .path = "src/main.zig" },
         .target = target,
         .optimize = optimize,
     });
+    const options = b.addOptions();
+    options.addOption(bool, "pam", pam);
+    exe.root_module.addOptions("config", options);
+
     exe.linkLibC();
-    exe.linkSystemLibrary("crypt");
+    if (pam) {
+        exe.linkSystemLibrary("pam");
+    } else {
+        exe.linkSystemLibrary("crypt");
+    }
 
     const install = b.addInstallArtifact(exe, .{});
     const add_setuid_bit = b.addSystemCommand(&.{

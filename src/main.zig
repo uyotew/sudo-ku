@@ -1,7 +1,9 @@
 const std = @import("std");
+const config = @import("config");
 const playSudoku = @import("sudoku.zig").playSudoku;
 const eql = std.mem.eql;
 const crypt = @cImport(@cInclude("crypt.h")).crypt;
+const pam = @import("pam_auth.zig");
 
 pub fn main() !void {
     const pal = std.heap.page_allocator;
@@ -40,12 +42,12 @@ pub fn main() !void {
             _ = try fd.write("0");
         } else {
             if (rule.opts.sudoku) |cells| if (!try playSudoku(cells)) return error.Denied;
-            if (!rule.opts.nopass) if (!try checkPassword(pal)) return error.Denied;
+            if (!rule.opts.nopass) try checkPassword(pal);
             _ = try fd.write("0");
         }
     } else {
         if (rule.opts.sudoku) |cells| if (!try playSudoku(cells)) return error.Denied;
-        if (!rule.opts.nopass) if (!try checkPassword(pal)) return error.Denied;
+        if (!rule.opts.nopass) try checkPassword(pal);
     }
 
     var argv = std.ArrayList([]const u8).init(pal);
@@ -91,23 +93,29 @@ fn getRulePersistentFilePath(pal: std.mem.Allocator, rule: Rule) ![]const u8 {
     return try std.mem.concat(pal, u8, &.{ "/tmp/sudo-ku/", hash });
 }
 
-fn checkPassword(pal: std.mem.Allocator) !bool {
-    const pwd_c = blk: {
-        var buf: [2048]u8 = undefined;
-        break :blk try getPasswordFromUser(&buf);
-    };
+/// errors if unable to authenticate
+fn checkPassword(pal: std.mem.Allocator) !void {
     const user = try getUsernameFromId(pal, std.os.linux.getuid());
     defer pal.free(user);
-    const entry_c = try getShadowEntry(pal, user);
-    defer pal.free(entry_c);
-    const pwd_hash = crypt(pwd_c, entry_c);
-    if (eql(u8, std.mem.span(pwd_hash), entry_c)) return true;
-    return false;
+
+    if (config.pam) {
+        return try pam.authenticate(user);
+    } else {
+        const pwd_c = blk: {
+            var buf: [2048]u8 = undefined;
+            break :blk try getPasswordFromUser(&buf);
+        };
+        const entry_c = try getShadowEntry(pal, user);
+        defer pal.free(entry_c);
+        const pwd_hash = crypt(pwd_c, entry_c);
+        if (eql(u8, std.mem.span(pwd_hash), entry_c)) return;
+        return error.Denied;
+    }
 }
 fn getPasswordFromUser(buf: []u8) ![:0]const u8 {
     const w = std.io.getStdOut().writer();
     const r = std.io.getStdIn().reader();
-    try w.writeAll("[sudo-ku] password: ");
+    try w.writeAll("[sudo-ku] Password: ");
     const original_termios = try std.os.tcgetattr(0);
     try std.os.tcsetattr(0, .FLUSH, blk: {
         var termios = original_termios;
@@ -125,7 +133,7 @@ fn getPasswordFromUser(buf: []u8) ![:0]const u8 {
     return buf[0 .. len - 1 :0];
 }
 
-pub fn getUsernameFromId(pal: std.mem.Allocator, id: std.os.uid_t) ![]const u8 {
+pub fn getUsernameFromId(pal: std.mem.Allocator, id: std.os.uid_t) ![:0]const u8 {
     var f = try std.fs.openFileAbsolute("/etc/passwd", .{});
     defer f.close();
     const buf = try f.readToEndAlloc(pal, 1 << 16);
@@ -138,7 +146,7 @@ pub fn getUsernameFromId(pal: std.mem.Allocator, id: std.os.uid_t) ![]const u8 {
         _ = it.next() orelse return err;
         const id_str = it.next() orelse return err;
         if (try std.fmt.parseUnsigned(std.os.uid_t, id_str, 10) == id) {
-            return try pal.dupe(u8, user);
+            return try pal.dupeZ(u8, user);
         } else continue;
     }
     return error.UserNotFound;

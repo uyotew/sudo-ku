@@ -6,6 +6,14 @@ $ mv zig-out/sudokuers /etc/sudokuers
 $ chown root: /etc/sudokuers
 $ chmod 644 /etc/sudokuers
 
+if you want pam authentication:
+use the flag -Dpam when running zig build (not zig build gen)
+and paste the following two lines into /etc/pam.d/sudo-ku
+
+#%PAM-1.0
+auth		include		system-auth
+
+
 /etc/sudokuers contains the access rules for sudo-ku
 
 the format is basically the same as for doas:

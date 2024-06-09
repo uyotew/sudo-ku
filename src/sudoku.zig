@@ -105,6 +105,7 @@ const Sudoku = struct {
     /// will always fail at generating a sudoku with fewer given cells than 17
     /// runtime increases with fewer given cells
     pub fn generate(cells_given: u8, rng: std.rand.Random) !Sudoku {
+        std.debug.assert(cells_given > 17 and cells_given <= 81);
         var unused: [81][9]bool = undefined;
         for (&unused) |*cell| @memset(cell, true);
         var s = Sudoku{ .grid = [_][9]?Cell{[_]?Cell{null} ** 9} ** 9 };
@@ -117,7 +118,7 @@ const Sudoku = struct {
         }
 
         // this could be made to backtrack.. but probably wont
-        const n_removed = if (cells_given > 81) 0 else 81 - cells_given;
+        const n_removed = 81 - cells_given;
         var to_try: [81]u8 = undefined;
         for (&to_try, 0..) |*c, i| c.* = @intCast(i);
         var i: u8 = 0;
@@ -189,8 +190,8 @@ const Sudoku = struct {
     }
 
     // returns false if no solution
-    // start_idx should at most be 80
     fn solve(self: *Sudoku, unused: *[81][9]bool, rng: std.rand.Random, start_idx: u8) bool {
+        std.debug.assert(start_idx <= 80);
         var i: struct {
             idx: u8,
             dir: enum(i2) { Fwd = 1, Bck = -1, Cnt = 0 } = .Cnt,

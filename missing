@@ -11,3 +11,12 @@ functionality related to environment variables
 restrictions and stuff.
 
 
+maybe use execvpeZ_expandArg0
+to log the full path of the command
+
+it doesn't seem like pam is working as i expected.
+the rules in /etc/login.defs don't seem to be respected?
+should they be?
+maybe it works as it should,
+the timeout seems to work,,
+but retries seems to.. not work..

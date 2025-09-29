@@ -1,0 +1,5 @@
+# default sudo-kuers file
+
+# permit all users in group wheel to run any command
+# as long as they solve the sudoku and submit their password
+permit sudoku for :wheel  
